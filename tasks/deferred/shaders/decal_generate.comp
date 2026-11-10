@@ -1,0 +1,63 @@
+#version 450
+layout(local_size_x=16, local_size_y=16, local_size_z=1) in;
+layout(set=0, binding=0, rgba8) uniform writeonly image2D outAlbedo;
+layout(set=0, binding=1, rgba8) uniform writeonly image2D outNormals;
+layout(set=0, binding=2, rgba8) uniform writeonly image2D outRoughness;
+
+float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+float noise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash(i), hash(i+vec2(1,0)), f.x),
+               mix(hash(i+vec2(0,1)), hash(i+1.0), f.x), f.y);
+}
+float fbm(vec2 p) {
+    float value = 0.0, a = 0.5;
+    for (int i=0; i<4; ++i) { value += a * noise(p); p *= 2.07; a *= 0.5; }
+    return value / 0.9375;
+}
+float mask(vec2 uv, int type) {
+    vec2 p = uv * 2.0 - 1.0;
+    float r = length(p * vec2(1.0, 1.13));
+    float irregular = (fbm(uv * 11.0 + vec2(float(type)*18.5)) - 0.5) * 0.25;
+    float edge = 1.0 - smoothstep(0.64 + irregular, 0.91 + irregular, r);
+    float flecks = fbm(uv * 28.0 + float(type) * 19.0);
+    if (type == 2) {
+        float cracks = abs(sin(uv.x * 27.0 + fbm(uv*8.0)*12.0)
+                         * sin(uv.y * 21.0 + fbm(uv*12.0)*14.0));
+        return edge * (1.0 - smoothstep(0.0, 0.22, cracks)) * 0.95;
+    }
+    return edge * smoothstep(0.24, 0.6, flecks);
+}
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= 1024 || pix.y >= 256) return;
+    int type = pix.x / 256;
+    vec2 uv = (vec2(pix.x % 256, pix.y) + 0.5) / 256.0;
+    float n = fbm(uv * 15.0 + vec2(type*13.1, type*21.7));
+    float fine = noise(uv * 110.0 + float(type));
+    float alpha = mask(uv, type);
+    vec3 c;
+    float rough;
+    if (type == 0) {
+        c = mix(vec3(0.18, 0.11, 0.065), vec3(0.51, 0.33, 0.16), n);
+        rough = 0.95;
+    } else if (type == 1) {
+        c = mix(vec3(0.035, 0.13, 0.036), vec3(0.16, 0.35, 0.07), n);
+        rough = 0.91;
+    } else if (type == 2) {
+        c = mix(vec3(0.035, 0.037, 0.041), vec3(0.13, 0.12, 0.11), n);
+        rough = 0.87;
+    } else {
+        c = mix(vec3(0.09, 0.12, 0.115), vec3(0.19, 0.23, 0.21), n);
+        rough = 0.16 + 0.15 * n;
+    }
+    vec2 grad = vec2(noise(uv * 55.0 + vec2(1.0, 0.0)) - fine,
+                     noise(uv * 55.0 + vec2(0.0, 1.0)) - fine);
+    vec3 normalTS = normalize(vec3(grad * (type == 2 ? 0.85 : 0.40), 1.0));
+    imageStore(outAlbedo, pix, vec4(c, alpha));
+    imageStore(outNormals, pix, vec4(normalTS * 0.5 + 0.5, 1.0));
+    imageStore(outRoughness, pix, vec4(clamp(rough + 0.12 * (fine-0.5), 0.04, 1.0), 0, 0, 1.0));
+}
