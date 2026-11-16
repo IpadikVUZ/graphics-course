@@ -19,3 +19,5 @@ target_add_shaders(instancing
   shaders/rocks.vert
   shaders/rocks.frag
 )
+
+target_compile_definitions(instancing PRIVATE INSTANCING_TEXTURES_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}/textures/\")

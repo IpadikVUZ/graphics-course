@@ -8,6 +8,10 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+#include <string>
 
 void WorldRenderer::resizeDepth(glm::uvec2 res)
 {
@@ -30,24 +34,57 @@ void WorldRenderer::allocateResources(glm::uvec2 res)
     .format = vk::Format::eR32Sfloat,
     .imageUsage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
   });
-  albedoAtlas = ctx.createImage(etna::Image::CreateInfo{
-    .extent = vk::Extent3D{1024, 256, 1},
-    .name = "PBR_albedo_sand_grass_rock_snow",
-    .format = vk::Format::eR8G8B8A8Unorm,
-    .imageUsage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
-  });
-  roughnessAtlas = ctx.createImage(etna::Image::CreateInfo{
-    .extent = vk::Extent3D{1024, 256, 1},
-    .name = "PBR_roughness_sand_grass_rock_snow",
-    .format = vk::Format::eR32Sfloat,
-    .imageUsage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
-  });
-  detailHeightAtlas = ctx.createImage(etna::Image::CreateInfo{
-    .extent = vk::Extent3D{1024, 256, 1},
-    .name = "PBR_detail_height_sand_grass_rock_snow",
-    .format = vk::Format::eR32Sfloat,
-    .imageUsage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
-  });
+  const auto createMaterialAtlas = [&](const char* name, vk::Format format) {
+    auto info = etna::Image::CreateInfo{
+      .extent = vk::Extent3D{kAtlasWidth, kAtlasHeight, 1},
+      .name = name,
+      .format = format,
+      .imageUsage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+    };
+    info.mipLevels = kTextureMipLevels;
+    return ctx.createImage(info);
+  };
+  albedoAtlas = createMaterialAtlas("PBR_albedo_sand_grass_rock_snow", vk::Format::eR8G8B8A8Srgb);
+  roughnessAtlas = createMaterialAtlas("PBR_roughness_sand_grass_rock_snow", vk::Format::eR8Unorm);
+  detailHeightAtlas = createMaterialAtlas("PBR_detail_height_sand_grass_rock_snow", vk::Format::eR8Unorm);
+
+  constexpr std::array<const char*, 3> files = {
+    "albedo_mips.bin", "roughness_mips.bin", "detail_height_mips.bin"
+  };
+  constexpr std::array<uint32_t, 3> bytesPerPixel = {4, 1, 1};
+  for (size_t i = 0; i < files.size(); ++i)
+  {
+    vk::DeviceSize size = 0;
+    for (uint32_t mip = 0; mip < kTextureMipLevels; ++mip)
+      size += vk::DeviceSize(kAtlasWidth >> mip) * (kAtlasHeight >> mip) * bytesPerPixel[i];
+
+    const auto path = std::filesystem::path(INSTANCING_TEXTURES_ROOT) / files[i];
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input || input.tellg() != static_cast<std::streamoff>(size))
+      throw std::runtime_error("Missing or invalid terrain texture: " + path.string());
+    input.seekg(0);
+
+    textureStaging[i] = ctx.createBuffer(etna::Buffer::CreateInfo{
+      .size = size,
+      .bufferUsage = vk::BufferUsageFlagBits::eTransferSrc,
+      .memoryUsage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+      .allocationCreate =
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+      .name = files[i],
+    });
+    input.read(reinterpret_cast<char*>(textureStaging[i].data()), static_cast<std::streamsize>(size));
+    if (!input)
+      throw std::runtime_error("Could not read terrain texture: " + path.string());
+  }
+  materialSampler = ctx.getDevice().createSamplerUnique(vk::SamplerCreateInfo{
+    .magFilter = vk::Filter::eLinear,
+    .minFilter = vk::Filter::eLinear,
+    .mipmapMode = vk::SamplerMipmapMode::eLinear,
+    .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+    .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+    .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+    .maxLod = static_cast<float>(kTextureMipLevels - 1),
+  }).value;
   sampler = etna::Sampler(etna::Sampler::CreateInfo{.name = "terrain_linear_sampler"});
 
   std::vector<uint32_t> meshIndices;
@@ -145,17 +182,11 @@ void WorldRenderer::generateMaps(vk::CommandBuffer cmd)
                     vk::ImageLayout::eGeneral, vk::ImageAspectFlagBits::eColor);
   };
   toStorage(heightMap);
-  toStorage(albedoAtlas);
-  toStorage(roughnessAtlas);
-  toStorage(detailHeightAtlas);
   etna::flush_barriers(cmd);
 
   auto shader = etna::get_shader_program("terrain_generate");
   auto set = etna::create_descriptor_set(shader.getDescriptorLayoutId(0), cmd, {
     etna::Binding{0, heightMap.genBinding(vk::Sampler{}, vk::ImageLayout::eGeneral)},
-    etna::Binding{1, albedoAtlas.genBinding(vk::Sampler{}, vk::ImageLayout::eGeneral)},
-    etna::Binding{2, roughnessAtlas.genBinding(vk::Sampler{}, vk::ImageLayout::eGeneral)},
-    etna::Binding{3, detailHeightAtlas.genBinding(vk::Sampler{}, vk::ImageLayout::eGeneral)},
   });
   cmd.bindPipeline(vk::PipelineBindPoint::eCompute, generatePipeline.getVkPipeline());
   cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
@@ -173,23 +204,77 @@ void WorldRenderer::generateMaps(vk::CommandBuffer cmd)
                     vk::ImageAspectFlagBits::eColor);
   };
   toSampled(heightMap);
-  toSampled(albedoAtlas);
-  toSampled(roughnessAtlas);
-  toSampled(detailHeightAtlas);
   etna::flush_barriers(cmd);
   pendingGeneration = false;
 }
 
+void WorldRenderer::uploadTextures(vk::CommandBuffer cmd)
+{
+  const std::array<etna::Image*, 3> atlases = {&albedoAtlas, &roughnessAtlas, &detailHeightAtlas};
+  constexpr std::array<uint32_t, 3> bytesPerPixel = {4, 1, 1};
+
+  const auto transition = [&](vk::ImageLayout oldLayout, vk::ImageLayout newLayout,
+                              vk::PipelineStageFlags2 sourceStage, vk::AccessFlags2 sourceAccess,
+                              vk::PipelineStageFlags2 targetStage, vk::AccessFlags2 targetAccess) {
+    std::array<vk::ImageMemoryBarrier2, 3> barriers;
+    for (size_t i = 0; i < atlases.size(); ++i)
+      barriers[i] = vk::ImageMemoryBarrier2{
+        .srcStageMask = sourceStage,
+        .srcAccessMask = sourceAccess,
+        .dstStageMask = targetStage,
+        .dstAccessMask = targetAccess,
+        .oldLayout = oldLayout,
+        .newLayout = newLayout,
+        .image = atlases[i]->get(),
+        .subresourceRange = vk::ImageSubresourceRange{
+          vk::ImageAspectFlagBits::eColor, 0, kTextureMipLevels, 0, 1},
+      };
+    cmd.pipelineBarrier2(vk::DependencyInfo{
+      .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
+      .pImageMemoryBarriers = barriers.data(),
+    });
+  };
+
+  transition(vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
+             vk::PipelineStageFlagBits2::eTopOfPipe, {},
+             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+
+  for (size_t i = 0; i < atlases.size(); ++i)
+  {
+    std::array<vk::BufferImageCopy, kTextureMipLevels> regions;
+    vk::DeviceSize offset = 0;
+    for (uint32_t mip = 0; mip < kTextureMipLevels; ++mip)
+    {
+      const uint32_t width = kAtlasWidth >> mip;
+      const uint32_t height = kAtlasHeight >> mip;
+      regions[mip] = vk::BufferImageCopy{
+        .bufferOffset = offset,
+        .imageSubresource = vk::ImageSubresourceLayers{vk::ImageAspectFlagBits::eColor, mip, 0, 1},
+        .imageExtent = vk::Extent3D{width, height, 1},
+      };
+      offset += vk::DeviceSize(width) * height * bytesPerPixel[i];
+    }
+    cmd.copyBufferToImage(textureStaging[i].get(), atlases[i]->get(),
+                          vk::ImageLayout::eTransferDstOptimal, regions);
+  }
+
+  transition(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+             vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+             vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderSampledRead);
+  pendingTextureUpload = false;
+}
+
 void WorldRenderer::renderWorld(vk::CommandBuffer cmd, vk::Image target, vk::ImageView view, uint32_t frameSlot)
 {
+  if (pendingTextureUpload) uploadTextures(cmd);
   if (pendingGeneration) generateMaps(cmd);
 
   auto shader = etna::get_shader_program("terrain_surface");
   auto set = etna::create_descriptor_set(shader.getDescriptorLayoutId(0), cmd, {
     etna::Binding{0, heightMap.genBinding(sampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
-    etna::Binding{1, albedoAtlas.genBinding(sampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
-    etna::Binding{2, roughnessAtlas.genBinding(sampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
-    etna::Binding{3, detailHeightAtlas.genBinding(sampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
+    etna::Binding{1, albedoAtlas.genBinding(materialSampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
+    etna::Binding{2, roughnessAtlas.genBinding(materialSampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
+    etna::Binding{3, detailHeightAtlas.genBinding(materialSampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
   });
   etna::RenderTargetState renderTargets(
     cmd,
