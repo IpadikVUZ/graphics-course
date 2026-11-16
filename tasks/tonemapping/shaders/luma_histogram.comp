@@ -1,0 +1,30 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set=0, binding=0) uniform sampler2D hdrImage;
+layout(set=0, binding=1, std430) readonly buffer FrameRange { vec4 range; } frameRange;
+layout(set=0, binding=2, std430) buffer Histogram { uint bins[128]; } histogram;
+layout(push_constant) uniform Settings { int useShared; } params;
+shared uint localBins[128];
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    if (params.useShared != 0 && tid < 128u)
+        localBins[tid] = 0u;
+    barrier();
+
+    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = textureSize(hdrImage, 0);
+    if (all(lessThan(xy, extent))) {
+        vec3 rgb = max(texelFetch(hdrImage, xy, 0).rgb, vec3(0.0));
+        float luminance = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+        float logLum = clamp(log2(max(luminance, 0.00001)), -18.0, 16.0);
+        float normalized = clamp((logLum - frameRange.range.x) /
+                                 max(frameRange.range.y - frameRange.range.x, 0.001), 0.0, 1.0);
+        uint bin = min(uint(normalized * 128.0), 127u);
+        if (params.useShared != 0) atomicAdd(localBins[bin], 1u);
+        else atomicAdd(histogram.bins[bin], 1u);
+    }
+    barrier();
+    if (params.useShared != 0 && tid < 128u && localBins[tid] != 0u)
+        atomicAdd(histogram.bins[tid], localBins[tid]);
+}

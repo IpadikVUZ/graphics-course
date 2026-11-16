@@ -1,0 +1,125 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2DArray skyFaces;
+
+layout(push_constant) uniform SkyParams {
+    vec4 sunDirection;
+    vec4 sunColor;
+    vec4 clouds;
+    vec4 layer;
+    vec4 tileInfo;
+} params;
+
+const float PI = 3.141592653589793;
+
+vec3 faceDirection(uint face, vec2 uv) {
+    if (face == 0u) return normalize(vec3(1.0, -uv.y, -uv.x));
+    if (face == 1u) return normalize(vec3(-1.0, -uv.y, uv.x));
+    if (face == 2u) return normalize(vec3(uv.x, 1.0, uv.y));
+    if (face == 3u) return normalize(vec3(uv.x, -1.0, -uv.y));
+    if (face == 4u) return normalize(vec3(uv.x, -uv.y, 1.0));
+    return normalize(vec3(-uv.x, -uv.y, -1.0));
+}
+
+float random3(ivec3 p) {
+    uint x = uint(p.x) * 1597334677u + uint(p.y) * 3812015801u + uint(p.z) * 2798796415u;
+    x = (x ^ (x >> 16u)) * 2246822519u;
+    x = (x ^ (x >> 13u)) * 3266489917u;
+    return float(x ^ (x >> 16u)) * (1.0 / 4294967295.0);
+}
+
+float valueNoise(vec3 p) {
+    ivec3 base = ivec3(floor(p));
+    vec3 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = mix(random3(base), random3(base + ivec3(1,0,0)), f.x);
+    float b = mix(random3(base + ivec3(0,1,0)), random3(base + ivec3(1,1,0)), f.x);
+    float c = mix(random3(base + ivec3(0,0,1)), random3(base + ivec3(1,0,1)), f.x);
+    float d = mix(random3(base + ivec3(0,1,1)), random3(base + ivec3(1,1,1)), f.x);
+    return mix(mix(a, b, f.y), mix(c, d, f.y), f.z);
+}
+
+float fbm(vec3 p) {
+    float sum = 0.0;
+    float weight = 0.0;
+    float amplitude = 0.5;
+    for (int i = 0; i < 3; ++i) {
+        sum += valueNoise(p) * amplitude;
+        weight += amplitude;
+        p *= 2.07;
+        amplitude *= 0.5;
+    }
+    return sum / weight;
+}
+
+float cloudDensity(vec3 world) {
+    float bottom = params.layer.x;
+    float top = params.layer.y;
+    if (world.y <= bottom || world.y >= top) return 0.0;
+    float feather = min((top - bottom) * 0.23, 4.0);
+    float vertical = smoothstep(bottom, bottom + feather, world.y) *
+                     (1.0 - smoothstep(top - feather, top, world.y));
+    float n = fbm(world * params.clouds.z + vec3(19.0, 3.0, 11.0));
+    float threshold = mix(0.80, 0.36, params.clouds.x);
+    float body = smoothstep(threshold - 0.10, threshold + 0.08, n);
+    return body * vertical * params.clouds.y;
+}
+
+vec4 bakeSky(vec3 rayDir) {
+    float t = clamp(rayDir.y * 0.5 + 0.5, 0.0, 1.0);
+    float skyMix = pow(t, 0.72);
+    vec3 sky = mix(vec3(0.72, 0.86, 1.00), vec3(0.12, 0.25, 0.54), skyMix);
+    float theta = acos(clamp(dot(rayDir, params.sunDirection.xyz), -1.0, 1.0));
+    float disc = exp(-theta * theta * 9000.0);
+    float halo = exp(-theta * 42.0);
+    sky += params.sunColor.rgb * params.sunDirection.w * (disc * 6.3 + halo * 0.25);
+
+    if (rayDir.y <= 0.035 || params.clouds.x <= 0.001 || params.clouds.y <= 0.001)
+        return vec4(sky, 1.0);
+
+    float first = params.layer.x / rayDir.y;
+    float last = min(params.layer.y / rayDir.y, 310.0);
+    if (first >= last) return vec4(sky, 1.0);
+
+    int steps = int(params.layer.z + 0.5);
+    int shadowSteps = int(params.layer.w + 0.5);
+    float stepSize = (last - first) / float(steps);
+    vec3 sumColor = vec3(0.0);
+    float transmission = 1.0;
+
+    for (int i = 0; i < steps; ++i) {
+        vec3 pos = rayDir * (first + (float(i) + 0.5) * stepSize);
+        float density = cloudDensity(pos);
+        if (density <= 0.002) continue;
+
+        float sunTravel = min(95.0, max(0.0, (params.layer.y - pos.y) /
+                                          max(params.sunDirection.y, 0.15)));
+        float shadowStep = sunTravel / float(shadowSteps);
+        float shadowMass = 0.0;
+        for (int s = 0; s < shadowSteps; ++s) {
+            vec3 shadowPos = pos + params.sunDirection.xyz * ((float(s) + 0.5) * shadowStep);
+            shadowMass += cloudDensity(shadowPos) * shadowStep;
+        }
+        float sunTransmission = exp(-shadowMass * params.clouds.w * 0.35);
+        float forwardScatter = 0.78 + 0.22 * pow(max(dot(rayDir, params.sunDirection.xyz), 0.0), 8.0);
+        vec3 cloudColor = mix(vec3(0.62, 0.68, 0.76),
+                              params.sunColor.rgb * (0.90 + params.sunDirection.w * 0.16),
+                              sunTransmission * (0.55 + 0.45 * forwardScatter));
+        float alpha = 1.0 - exp(-density * stepSize * 0.42);
+        sumColor += transmission * alpha * cloudColor;
+        transmission *= 1.0 - alpha;
+        if (transmission < 0.012) break;
+    }
+    return vec4(sky * transmission + sumColor, transmission);
+}
+
+void main() {
+    ivec3 index = params.tileInfo.z < 0.0
+        ? ivec3(gl_GlobalInvocationID.xyz)
+        : ivec3(ivec2(gl_GlobalInvocationID.xy) + ivec2(params.tileInfo.xy), int(params.tileInfo.z));
+    if (any(greaterThanEqual(index.xy, ivec2(2048))) || index.z >= 6) return;
+    vec2 uv = ((vec2(index.xy) + vec2(0.5)) / 2048.0) * 2.0 - 1.0;
+    vec3 rayDir = faceDirection(uint(index.z), uv);
+    imageStore(skyFaces, index, bakeSky(rayDir));
+}

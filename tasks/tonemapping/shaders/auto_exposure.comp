@@ -1,0 +1,59 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(set=0, binding=0, std430) readonly buffer FrameRange { vec4 range; } frameRange;
+layout(set=0, binding=1, std430) readonly buffer Histogram { uint bins[128]; } histogram;
+layout(set=0, binding=2, std430) readonly buffer Previous { vec4 values; } previous;
+layout(set=0, binding=3, std430) writeonly buffer Current { vec4 values; } current;
+layout(push_constant) uniform ExposureSettings {
+    vec4 controls;
+    vec4 metering;
+} params;
+
+void main() {
+    uint count = 0u;
+    for (uint i = 0u; i < 128u; ++i) count += histogram.bins[i];
+
+    float sceneLog = 0.0;
+    float highlightLog = 0.0;
+    float lo = clamp(frameRange.range.x, -18.0, 16.0);
+    float hi = clamp(frameRange.range.y, lo + 0.001, 16.001);
+    if (count != 0u) {
+        uint midGoal = max(1u, uint(ceil(float(count) * 0.60)));
+        uint highlightGoal = max(1u, uint(ceil(float(count) * 0.93)));
+        uint sum = 0u;
+        bool midFound = false;
+        for (uint i = 0u; i < 128u; ++i) {
+            sum += histogram.bins[i];
+            float logValue = mix(lo, hi, (float(i) + 0.5) / 128.0);
+            if (!midFound && sum >= midGoal) {
+                sceneLog = logValue;
+                midFound = true;
+            }
+            if (sum >= highlightGoal) {
+                highlightLog = logValue;
+                break;
+            }
+        }
+    }
+
+    float rawExposure = min(0.38 / max(exp2(sceneLog), 0.00001),
+                            1.25 / max(exp2(highlightLog), 0.00001));
+    rawExposure = clamp(rawExposure, 0.15, 5.0);
+    float influence = clamp(params.metering.y, 0.0, 1.0);
+    float compensationEV = clamp(params.controls.z, -6.0, 6.0);
+    float targetEV = compensationEV;
+    if (params.metering.x > 0.5)
+        targetEV += log2(rawExposure) * influence;
+    targetEV = clamp(targetEV, -6.0, 6.0);
+
+    float previousExposure = previous.values.x;
+    if (isnan(previousExposure) || isinf(previousExposure) || previousExposure <= 0.0)
+        previousExposure = exp2(targetEV);
+    float oldEV = params.controls.w > 0.5 ? targetEV : log2(previousExposure);
+    oldEV = clamp(oldEV, -6.0, 6.0);
+    float alpha = 1.0 - exp(-max(params.controls.x, 0.0) * max(params.controls.y, 0.0));
+    float newEV = mix(oldEV, targetEV, clamp(alpha, 0.0, 1.0));
+    float maxStepEV = max(params.controls.x, 0.0) * 1.0;
+    newEV = clamp(newEV, oldEV - maxStepEV, oldEV + maxStepEV);
+    current.values = vec4(exp2(newEV), exp2(targetEV), sceneLog, highlightLog);
+}

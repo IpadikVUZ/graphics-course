@@ -1,0 +1,34 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set=0, binding=0) uniform sampler2D hdrImage;
+layout(set=0, binding=1, std430) writeonly buffer GroupRanges { vec2 ranges[]; } groupRanges;
+shared float mins[256];
+shared float maxs[256];
+
+void main() {
+    uint index = gl_LocalInvocationIndex;
+    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = textureSize(hdrImage, 0);
+    float value = 0.0;
+    bool valid = all(lessThan(xy, extent));
+    if (valid) {
+        vec3 rgb = max(texelFetch(hdrImage, xy, 0).rgb, vec3(0.0));
+        float luminance = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+        value = clamp(log2(max(luminance, 0.00001)), -18.0, 16.0);
+    }
+    mins[index] = valid ? value : 1e30;
+    maxs[index] = valid ? value : -1e30;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (index < stride) {
+            mins[index] = min(mins[index], mins[index + stride]);
+            maxs[index] = max(maxs[index], maxs[index + stride]);
+        }
+        barrier();
+    }
+    if (index == 0u) {
+        uint groupsPerRow = (uint(extent.x) + 15u) / 16u;
+        uint groupIndex = gl_WorkGroupID.y * groupsPerRow + gl_WorkGroupID.x;
+        groupRanges.ranges[groupIndex] = vec2(mins[0], maxs[0]);
+    }
+}
