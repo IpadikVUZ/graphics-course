@@ -5,7 +5,6 @@ import pathlib
 import struct
 import sys
 
-
 ROOT = pathlib.Path(sys.argv[1])
 ROOT.mkdir(parents=True, exist_ok=True)
 COMPONENTS = {5120: ('b', 1), 5121: ('B', 1), 5122: ('h', 2),
@@ -55,6 +54,18 @@ def dot(a, b):
 def normalize(v):
     n = math.sqrt(dot(v, v))
     return tuple(x / n for x in v) if n > 1e-10 else (0., 1., 0.)
+
+
+def sub(a, b):
+    return tuple(a[i] - b[i] for i in range(len(a)))
+
+
+def muls(v, s):
+    return tuple(x * s for x in v)
+
+
+def add(a, b):
+    return tuple(a[i] + b[i] for i in range(len(a)))
 
 
 def normal_transform(m, n):
@@ -117,6 +128,7 @@ def convert(asset):
                 attributes = primitive['attributes']
                 positions = accessor(attributes['POSITION'])
                 normals = accessor(attributes['NORMAL']) if 'NORMAL' in attributes else None
+                texcoords = accessor(attributes['TEXCOORD_0']) if 'TEXCOORD_0' in attributes else None
                 primitive_indices = ([v[0] for v in accessor(primitive['indices'])]
                                      if 'indices' in primitive else list(range(len(positions))))
                 if len(primitive_indices) % 3:
@@ -132,9 +144,39 @@ def convert(asset):
                         for i in (i0, i1, i2):
                             for k in range(3):
                                 normals[i][k] += n[k]
+                if texcoords is None:
+                    texcoords = [(0., 0.) for _ in positions]
                 start = len(vertices)
-                for p, n in zip(positions, normals):
-                    vertices.append((transform(matrix, p), normal_transform(matrix, n)))
+                transformed_positions = [transform(matrix, p) for p in positions]
+                transformed_normals = [normal_transform(matrix, n) for n in normals]
+                tan1 = [[0., 0., 0.] for _ in positions]
+                tan2 = [[0., 0., 0.] for _ in positions]
+                for j in range(0, len(primitive_indices), 3):
+                    i0, i1, i2 = primitive_indices[j:j+3]
+                    p0, p1, p2 = (transformed_positions[i] for i in (i0, i1, i2))
+                    uv0, uv1, uv2 = (texcoords[i] for i in (i0, i1, i2))
+                    e1 = sub(p1, p0)
+                    e2 = sub(p2, p0)
+                    duv1 = sub(uv1, uv0)
+                    duv2 = sub(uv2, uv0)
+                    det_uv = duv1[0] * duv2[1] - duv1[1] * duv2[0]
+                    if abs(det_uv) < 1e-10:
+                        continue
+                    r = 1.0 / det_uv
+                    sdir = muls(tuple(e1[k] * duv2[1] - e2[k] * duv1[1] for k in range(3)), r)
+                    tdir = muls(tuple(e2[k] * duv1[0] - e1[k] * duv2[0] for k in range(3)), r)
+                    for idx in (i0, i1, i2):
+                        tan1[idx] = [tan1[idx][k] + sdir[k] for k in range(3)]
+                        tan2[idx] = [tan2[idx][k] + tdir[k] for k in range(3)]
+                for p, n, uv, t, b in zip(transformed_positions, transformed_normals, texcoords, tan1, tan2):
+                    t = tuple(t)
+                    n_dot_t = dot(n, t)
+                    ortho_t = normalize(sub(t, muls(n, n_dot_t)))
+                    if dot(ortho_t, ortho_t) < 1e-10:
+                        ref = (1., 0., 0.) if abs(n[1]) > 0.9 else (0., 1., 0.)
+                        ortho_t = normalize(cross(ref, n))
+                    sign = -1.0 if dot(cross(n, ortho_t), tuple(b)) < 0.0 else 1.0
+                    vertices.append((p, n, (ortho_t[0], ortho_t[1], ortho_t[2], sign), uv))
                 flipped = determinant(matrix) < 0.
                 for j in range(0, len(primitive_indices), 3):
                     tri = primitive_indices[j:j+3]
@@ -157,12 +199,16 @@ def convert(asset):
     scale = (1.6 if asset == 'boulder_01' else 1.1) / extent
     result = ROOT / f'{asset}.mesh'
     with result.open('wb') as out:
-        out.write(struct.pack('<4sII', b'RCK1', len(vertices), len(indices)))
-        for p, n in vertices:
-            out.write(struct.pack('<8f', (p[0] - center_x) * scale,
+        out.write(struct.pack('<4sII', b'RCK2', len(vertices), len(indices)))
+        for p, n, t, uv in vertices:
+            out.write(struct.pack('<16f',
+                                  (p[0] - center_x) * scale,
                                   (p[1] - bounds_min[1]) * scale,
-                                  (p[2] - center_z) * scale, 1.,
-                                  *normalize(n), 0.))
+                                  (p[2] - center_z) * scale,
+                                  1.,
+                                  *normalize(n), 0.,
+                                  t[0], t[1], t[2], t[3],
+                                  uv[0], uv[1], 0., 0.))
         out.write(struct.pack(f'<{len(indices)}I', *indices))
     print(f'{asset}: {len(vertices)} vertices, {len(indices) // 3} triangles')
 

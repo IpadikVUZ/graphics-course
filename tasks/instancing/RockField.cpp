@@ -5,6 +5,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <imgui.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -99,6 +100,52 @@ bool sphereVisible(const std::array<glm::vec4, 6>& planes, glm::vec3 center, flo
 }
 }
 
+void RockField::loadMaterialTextures(Mesh& mesh, const char* stem)
+{
+  auto& ctx = etna::get_context();
+  constexpr std::array<const char*, 3> suffixes = {"albedo", "normal", "arm"};
+  constexpr std::array<vk::Format, 3> formats = {
+    vk::Format::eR8G8B8A8Srgb,
+    vk::Format::eR8G8B8A8Unorm,
+    vk::Format::eR8G8B8A8Unorm,
+  };
+  std::array<etna::Image*, 3> images = {&mesh.albedo, &mesh.normalMap, &mesh.arm};
+
+  vk::DeviceSize size = 0;
+  for (uint32_t mip = 0; mip < kTextureMipLevels; ++mip)
+    size += vk::DeviceSize(kTextureSize >> mip) * (kTextureSize >> mip) * 4;
+
+  for (size_t i = 0; i < suffixes.size(); ++i)
+  {
+    const std::string debugName = std::string(stem) + "_" + suffixes[i];
+    *images[i] = ctx.createImage(etna::Image::CreateInfo{
+      .extent = vk::Extent3D{kTextureSize, kTextureSize, 1},
+      .name = debugName.c_str(),
+      .format = formats[i],
+      .imageUsage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+      .mipLevels = kTextureMipLevels,
+    });
+
+    const std::string path = std::string(INSTANCING_ASSETS_ROOT) + stem + "_" + suffixes[i] + "_mips.bin";
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file || file.tellg() != static_cast<std::streamoff>(size))
+      throw std::runtime_error("Missing or invalid rock texture: " + path);
+    file.seekg(0);
+
+    mesh.textureStaging[i] = ctx.createBuffer(etna::Buffer::CreateInfo{
+      .size = size,
+      .bufferUsage = vk::BufferUsageFlagBits::eTransferSrc,
+      .memoryUsage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+      .allocationCreate = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                          VMA_ALLOCATION_CREATE_MAPPED_BIT,
+      .name = debugName.c_str(),
+    });
+    file.read(reinterpret_cast<char*>(mesh.textureStaging[i].data()), static_cast<std::streamsize>(size));
+    if (!file)
+      throw std::runtime_error("Could not read rock texture: " + path);
+  }
+}
+
 void RockField::loadMesh(uint32_t model, const char* name)
 {
   std::ifstream file(std::string(INSTANCING_ASSETS_ROOT) + name, std::ios::binary);
@@ -109,7 +156,7 @@ void RockField::loadMesh(uint32_t model, const char* name)
   file.read(magic, 4);
   file.read(reinterpret_cast<char*>(&vertexCount), 4);
   file.read(reinterpret_cast<char*>(&indexCount), 4);
-  if (std::memcmp(magic, "RCK1", 4) != 0 || !vertexCount || !indexCount ||
+  if (std::memcmp(magic, "RCK2", 4) != 0 || !vertexCount || !indexCount ||
       vertexCount > 2000000 || indexCount > 6000000)
     throw std::runtime_error(std::string("Invalid rock mesh: ") + name);
 
@@ -152,12 +199,26 @@ void RockField::loadMesh(uint32_t model, const char* name)
                           VMA_ALLOCATION_CREATE_MAPPED_BIT,
       .name = "rock_instances",
     });
+
+  std::string stem{name};
+  const size_t dot = stem.rfind('.');
+  if (dot != std::string::npos) stem.resize(dot);
+  loadMaterialTextures(mesh, stem.c_str());
 }
 
 void RockField::allocateResources()
 {
   loadMesh(0, "boulder_01.mesh");
   loadMesh(1, "rock_09.mesh");
+  materialSampler = etna::get_context().getDevice().createSamplerUnique(vk::SamplerCreateInfo{
+    .magFilter = vk::Filter::eLinear,
+    .minFilter = vk::Filter::eLinear,
+    .mipmapMode = vk::SamplerMipmapMode::eLinear,
+    .addressModeU = vk::SamplerAddressMode::eRepeat,
+    .addressModeV = vk::SamplerAddressMode::eRepeat,
+    .addressModeW = vk::SamplerAddressMode::eRepeat,
+    .maxLod = static_cast<float>(kTextureMipLevels - 1),
+  }).value;
   for (auto& group : visible) group.reserve(kMaxInstances);
 }
 
@@ -182,6 +243,63 @@ void RockField::setupPipeline(vk::Format format)
         .depthAttachmentFormat = vk::Format::eD32Sfloat,
       },
     });
+}
+
+void RockField::uploadTextures(vk::CommandBuffer cmd, Mesh& mesh)
+{
+  std::array<etna::Image*, 3> images = {&mesh.albedo, &mesh.normalMap, &mesh.arm};
+  std::array<vk::ImageMemoryBarrier2, 3> barriers;
+  for (size_t i = 0; i < images.size(); ++i)
+    barriers[i] = vk::ImageMemoryBarrier2{
+      .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
+      .srcAccessMask = {},
+      .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+      .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+      .oldLayout = vk::ImageLayout::eUndefined,
+      .newLayout = vk::ImageLayout::eTransferDstOptimal,
+      .image = images[i]->get(),
+      .subresourceRange = vk::ImageSubresourceRange{
+        vk::ImageAspectFlagBits::eColor, 0, kTextureMipLevels, 0, 1},
+    };
+  cmd.pipelineBarrier2(vk::DependencyInfo{
+    .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
+    .pImageMemoryBarriers = barriers.data(),
+  });
+
+  for (size_t i = 0; i < images.size(); ++i)
+  {
+    std::array<vk::BufferImageCopy, kTextureMipLevels> regions;
+    vk::DeviceSize offset = 0;
+    for (uint32_t mip = 0; mip < kTextureMipLevels; ++mip)
+    {
+      const uint32_t extent = kTextureSize >> mip;
+      regions[mip] = vk::BufferImageCopy{
+        .bufferOffset = offset,
+        .imageSubresource = vk::ImageSubresourceLayers{vk::ImageAspectFlagBits::eColor, mip, 0, 1},
+        .imageExtent = vk::Extent3D{extent, extent, 1},
+      };
+      offset += vk::DeviceSize(extent) * extent * 4;
+    }
+    cmd.copyBufferToImage(mesh.textureStaging[i].get(), images[i]->get(),
+                          vk::ImageLayout::eTransferDstOptimal, regions);
+  }
+
+  for (size_t i = 0; i < images.size(); ++i)
+    barriers[i] = vk::ImageMemoryBarrier2{
+      .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+      .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+      .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+      .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead,
+      .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+      .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+      .image = images[i]->get(),
+      .subresourceRange = vk::ImageSubresourceRange{
+        vk::ImageAspectFlagBits::eColor, 0, kTextureMipLevels, 0, 1},
+    };
+  cmd.pipelineBarrier2(vk::DependencyInfo{
+    .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
+    .pImageMemoryBarriers = barriers.data(),
+  });
 }
 
 float RockField::heightAt(glm::vec2 uv) const
@@ -231,13 +349,12 @@ void RockField::generateChunk(int cx, int cz)
       transform = glm::rotate(transform, angle, glm::vec3(0.f, 1.f, 0.f));
       transform = glm::rotate(transform, tilt, glm::vec3(1.f, 0.f, 0.f));
       transform = glm::scale(transform, glm::vec3(s));
-      const float tint = 0.82f + 0.35f * random01(gx, gz, 0x4ae1f05bu);
-      const glm::vec3 base = model == 0u ? glm::vec3(0.43f, 0.42f, 0.39f) :
-                                            glm::vec3(0.48f, 0.35f, 0.29f);
+      const float tint = 0.88f + 0.24f * random01(gx, gz, 0x4ae1f05bu);
+      const glm::vec3 base = model == 0u ? glm::vec3(0.96f, 0.96f, 0.96f) :
+                                            glm::vec3(0.98f, 0.95f, 0.92f);
       const glm::vec3 pos(wx, height + 0.45f * s, wz);
       chunk.candidates.push_back(Candidate{
-        .instance = Instance{transform, glm::vec4(base * tint, 0.77f +
-                            0.2f * random01(gx, gz, 0x1f88030du))},
+        .instance = Instance{transform, glm::vec4(base * tint, 1.0f)},
         .center = pos,
         .radius = meshes[model].radius * s + 0.5f,
         .model = model,
@@ -331,12 +448,20 @@ void RockField::render(vk::CommandBuffer cmd, const etna::Image& heightMap,
   {
     if (visible[model].empty()) continue;
     auto& mesh = meshes[model];
+    if (pendingTextureUpload[model])
+    {
+      uploadTextures(cmd, mesh);
+      pendingTextureUpload[model] = false;
+    }
     std::memcpy(mesh.instances[frameSlot].data(), visible[model].data(),
                 visible[model].size() * sizeof(Instance));
     auto descriptor = etna::create_descriptor_set(shader.getDescriptorLayoutId(0), cmd, {
       etna::Binding{0, mesh.vertices.genBinding()},
       etna::Binding{1, mesh.instances[frameSlot].genBinding()},
       etna::Binding{2, heightMap.genBinding(sampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
+      etna::Binding{3, mesh.albedo.genBinding(materialSampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
+      etna::Binding{4, mesh.normalMap.genBinding(materialSampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
+      etna::Binding{5, mesh.arm.genBinding(materialSampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
     });
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.getVkPipelineLayout(),
                            0, {descriptor.getVkSet()}, {});

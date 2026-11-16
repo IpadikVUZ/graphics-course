@@ -1,7 +1,14 @@
 #version 450
 
+struct Vertex {
+    vec4 position;
+    vec4 normal;
+    vec4 tangent;
+    vec4 uv;
+};
+
 layout(set = 0, binding = 0, std430) readonly buffer RockVertices {
-    vec4 vertices[];
+    Vertex vertices[];
 };
 
 struct Instance {
@@ -25,17 +32,22 @@ layout(push_constant) uniform DrawSettings {
 
 layout(location = 0) out vec3 oWorld;
 layout(location = 1) out vec3 oNormal;
-layout(location = 2) out vec4 oColor;
+layout(location = 2) out vec4 oTangent;
+layout(location = 3) out vec2 oUV;
+layout(location = 4) out vec4 oColor;
 
 void main() {
-    vec3 pos = vertices[gl_VertexIndex * 2].xyz;
-    vec3 normal = vertices[gl_VertexIndex * 2 + 1].xyz;
+    Vertex v = vertices[gl_VertexIndex];
     Instance instance = instances[gl_InstanceIndex];
-    vec3 world = (instance.transform * vec4(pos, 1.0)).xyz;
-    vec2 uv = clamp(instance.transform[3].xz / 100.0 + 0.5, vec2(0.0), vec2(1.0));
-    world.y += max(textureLod(heightMap, uv, 0.0).r, 0.0);
+    vec3 world = (instance.transform * vec4(v.position.xyz, 1.0)).xyz;
+    vec2 islandUV = clamp(instance.transform[3].xz / 100.0 + 0.5, vec2(0.0), vec2(1.0));
+    world.y += max(textureLod(heightMap, islandUV, 0.0).r, 0.0);
+
+    mat3 normalMatrix = mat3(instance.transform);
     oWorld = world;
-    oNormal = normalize(mat3(instance.transform) * normal);
+    oNormal = normalize(normalMatrix * v.normal.xyz);
+    oTangent = vec4(normalize(normalMatrix * v.tangent.xyz), v.tangent.w);
+    oUV = v.uv.xy;
     oColor = instance.color;
     gl_Position = params.viewProj * vec4(world, 1.0);
 }
