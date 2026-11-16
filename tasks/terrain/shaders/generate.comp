@@ -1,0 +1,70 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, r32f) uniform writeonly image2D heightMap;
+
+layout(push_constant) uniform NoiseSettings {
+    float scale;
+    float persistence;
+    float lacunarity;
+    float heightScale;
+    float islandRadius;
+    int octaves;
+    int seed;
+    float shore;
+} settings;
+
+uint hash(uvec2 p) {
+    uint h = (p.x * 374761393u + p.y * 668265263u) ^ uint(settings.seed);
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return h ^ (h >> 16);
+}
+float rnd(ivec2 p) { return float(hash(uvec2(p))) / 4294967295.0; }
+float smoothNoise(vec2 p) {
+    ivec2 ip = ivec2(floor(p));
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(rnd(ip), rnd(ip + ivec2(1,0)), f.x),
+               mix(rnd(ip + ivec2(0,1)), rnd(ip + ivec2(1,1)), f.x), f.y);
+}
+float fbm(vec2 p, int count, float persistence, float lacunarity) {
+    float sum = 0.0, amp = 0.5, total = 0.0;
+    for (int i = 0; i < count; ++i) {
+        sum += smoothNoise(p) * amp;
+        total += amp;
+        p *= lacunarity;
+        amp *= persistence;
+    }
+    return sum / max(total, 0.00001);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= 1024 || pixel.y >= 1024) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / 1024.0;
+
+    float coastX = fbm(uv * 5.4 + vec2(18.4, 3.1), 3, 0.5, 2.0) - 0.5;
+    float coastY = fbm(uv * 5.4 + vec2(3.3, 13.1), 3, 0.5, 2.0) - 0.5;
+    vec2 p = (uv * 2.0 - 1.0) * vec2(1.05, 0.91)
+             + vec2(coastX, coastY) * 0.17;
+    float radius = length(p);
+    float island = 1.0 - smoothstep(settings.islandRadius - 0.30,
+                                    settings.islandRadius, radius);
+
+    float hills = fbm(uv * settings.scale + vec2(17.4, 6.8),
+                      settings.octaves, settings.persistence, settings.lacunarity);
+    float smallHills = fbm(uv * settings.scale * 2.8 + vec2(1.3, 8.1),
+                           4, 0.52, 2.05);
+    vec2 hillA = (uv - vec2(0.38, 0.51)) * vec2(6.2, 6.8);
+    vec2 hillB = (uv - vec2(0.64, 0.41)) * vec2(9.2, 6.3);
+    vec2 hillC = (uv - vec2(0.57, 0.70)) * vec2(11.0, 10.5);
+    float peaks = 7.8 * exp(-dot(hillA, hillA))
+                + 6.1 * exp(-dot(hillB, hillB))
+                + 2.6 * exp(-dot(hillC, hillC));
+    float h = (island * (2.0 + 3.3 * hills + 1.6 * smallHills + peaks)
+               - settings.shore) * settings.heightScale;
+    imageStore(heightMap, pixel, vec4(h, 0.0, 0.0, 1.0));
+
+}
