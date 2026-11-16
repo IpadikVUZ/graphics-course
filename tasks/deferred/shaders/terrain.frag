@@ -27,7 +27,10 @@ vec2 octEncode(vec3 n) {
 }
 
 vec2 materialUV(int m, vec2 localUV) {
-    vec2 texelSafe = clamp(fract(localUV), vec2(1.0/256.0), vec2(255.0/256.0));
+    float scale = max(length(dFdx(localUV)), length(dFdy(localUV))) * 1024.0;
+    float lod = clamp(ceil(log2(max(scale, 0.00001))), 0.0, 10.0);
+    float inset = 0.5 * exp2(lod) / 1024.0;
+    vec2 texelSafe = clamp(fract(localUV), vec2(inset), vec2(1.0 - inset));
     return vec2((float(m) + texelSafe.x) * 0.25, texelSafe.y);
 }
 
@@ -36,13 +39,16 @@ Surface material(int m, vec2 uv) {
     vec2 localUV = uv * params.detail.x;
     vec2 a = materialUV(m, localUV);
     Surface r;
-    r.albedo = texture(albedoAtlas, a).rgb;
-    r.roughness = texture(roughnessAtlas, a).r;
-    vec2 stepUV = vec2(1.0 / 256.0);
-    float dhdx = texture(detailHeightAtlas, materialUV(m, localUV + vec2(stepUV.x, 0))).r
-                - texture(detailHeightAtlas, materialUV(m, localUV - vec2(stepUV.x, 0))).r;
-    float dhdy = texture(detailHeightAtlas, materialUV(m, localUV + vec2(0, stepUV.y))).r
-                - texture(detailHeightAtlas, materialUV(m, localUV - vec2(0, stepUV.y))).r;
+    vec2 ddxUV = dFdx(localUV) * vec2(0.25, 1.0);
+    vec2 ddyUV = dFdy(localUV) * vec2(0.25, 1.0);
+    r.albedo = textureGrad(albedoAtlas, a, ddxUV, ddyUV).rgb;
+    r.roughness = textureGrad(roughnessAtlas, a, ddxUV, ddyUV).r;
+
+    vec2 stepUV = vec2(1.0 / 1024.0);
+    float dhdx = textureGrad(detailHeightAtlas, materialUV(m, localUV + vec2(stepUV.x, 0)), ddxUV, ddyUV).r
+                - textureGrad(detailHeightAtlas, materialUV(m, localUV - vec2(stepUV.x, 0)), ddxUV, ddyUV).r;
+    float dhdy = textureGrad(detailHeightAtlas, materialUV(m, localUV + vec2(0, stepUV.y)), ddxUV, ddyUV).r
+                - textureGrad(detailHeightAtlas, materialUV(m, localUV - vec2(0, stepUV.y)), ddxUV, ddyUV).r;
     r.slope = vec2(dhdx, dhdy);
     return r;
 }

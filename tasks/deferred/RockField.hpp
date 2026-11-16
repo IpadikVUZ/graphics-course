@@ -17,6 +17,7 @@ public:
   void allocateResources();
   void loadShaders();
   void setupPipelines();
+  void uploadPendingTextures(vk::CommandBuffer cmd);
   void update(const DrawSettings& draw, const NoiseSettings& noise);
   void invalidate();
   void drawGui();
@@ -29,6 +30,8 @@ private:
   {
     glm::vec4 position;
     glm::vec4 normal;
+    glm::vec4 tangent;
+    glm::vec4 uv;
   };
 
   struct Instance
@@ -50,6 +53,10 @@ private:
     etna::Buffer vertices;
     etna::Buffer indices;
     std::array<etna::Buffer, 2> instances;
+    std::array<etna::Buffer, 3> textureStaging;
+    etna::Image albedo;
+    etna::Image normalMap;
+    etna::Image arm;
     uint32_t indexCount = 0;
     float radius = 1.f;
   };
@@ -62,9 +69,13 @@ private:
   void loadMesh(uint32_t model, const char* path);
   void generateChunk(int x, int z);
   void updateVisible(const DrawSettings& draw);
+  void loadMaterialTextures(Mesh& mesh, const char* stem);
+  void uploadTextures(vk::CommandBuffer cmd, Mesh& mesh);
   float heightAt(glm::vec2 uv) const;
 
   static constexpr uint32_t kMaxInstances = 12000;
+  static constexpr uint32_t kTextureSize = 1024;
+  static constexpr uint32_t kTextureMipLevels = 11;
   static constexpr int kChunkCells = 6;
   static constexpr float kCellSize = 1.5f;
   static constexpr float kChunkSize = kChunkCells * kCellSize;
@@ -72,6 +83,7 @@ private:
   std::array<Mesh, 2> meshes;
   std::array<std::vector<Instance>, 2> visible;
   std::unordered_map<int64_t, Chunk> chunks;
+  vk::UniqueSampler materialSampler;
   etna::GraphicsPipeline depthPipeline{};
   std::array<etna::GraphicsPipeline, 2> geometryPipelines{};
   NoiseSettings noise{};
@@ -80,6 +92,7 @@ private:
   float drawDistance = 68.f;
   float minScale = 0.65f;
   float maxScale = 2.2f;
+  std::array<bool, 2> pendingTextureUpload{true, true};
   bool dirty = true;
   bool noiseDirty = true;
 };

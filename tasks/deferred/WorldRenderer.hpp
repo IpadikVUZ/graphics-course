@@ -24,6 +24,9 @@ public:
   void renderWorld(vk::CommandBuffer cmd, vk::Image target, vk::ImageView targetView, uint32_t frameSlot);
 
 private:
+  static constexpr uint32_t kAtlasWidth = 4096;
+  static constexpr uint32_t kAtlasHeight = 1024;
+  static constexpr uint32_t kTextureMipLevels = 11;
   static constexpr uint32_t kGridCells = 256;
   static constexpr uint32_t kIndexCount = kGridCells * kGridCells * 6;
   static constexpr uint32_t kDecalCount = 5;
@@ -47,6 +50,7 @@ private:
   };
 
   void generateMaps(vk::CommandBuffer cmd);
+  void uploadTextures(vk::CommandBuffer cmd);
   void generateDecalTextures(vk::CommandBuffer cmd);
   void writeDecalBuffer(uint32_t frameSlot);
   void drawTerrain(vk::CommandBuffer cmd, bool depthOnly);
@@ -67,6 +71,8 @@ private:
   etna::Image decalNormals;
   etna::Image decalRoughness;
   etna::Sampler sampler;
+  vk::UniqueSampler materialSampler;
+  std::array<etna::Buffer, 3> textureStaging;
   etna::Buffer indices;
   std::array<etna::Buffer, 2> decalGpuBuffers;
 
@@ -86,6 +92,7 @@ private:
   }};
   glm::uvec2 resolution{};
   bool pendingGeneration = true;
+  bool pendingTextureUpload = true;
   bool pendingDecalTextures = true;
   bool compactGBuffer = true;
   bool decalsEnabled = true;

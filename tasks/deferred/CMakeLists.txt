@@ -23,3 +23,5 @@ target_add_shaders(deferred
   shaders/decal.frag
   shaders/decal_generate.comp
 )
+
+target_compile_definitions(deferred PRIVATE DEFERRED_TEXTURES_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}/textures/\")
