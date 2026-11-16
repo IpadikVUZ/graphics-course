@@ -1,0 +1,33 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0, std430) readonly buffer GroupRanges { vec2 ranges[]; } groupRanges;
+layout(set=0, binding=1, std430) writeonly buffer FrameRange { vec4 range; } frameRange;
+layout(push_constant) uniform Settings { uint groupCount; } params;
+shared float mins[256];
+shared float maxs[256];
+
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    float lo = 1e30;
+    float hi = -1e30;
+    for (uint j = i; j < params.groupCount; j += 256u) {
+        vec2 r = groupRanges.ranges[j];
+        lo = min(lo, r.x);
+        hi = max(hi, r.y);
+    }
+    mins[i] = lo;
+    maxs[i] = hi;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (i < stride) {
+            mins[i] = min(mins[i], mins[i + stride]);
+            maxs[i] = max(maxs[i], maxs[i + stride]);
+        }
+        barrier();
+    }
+    if (i == 0u) {
+        float minLog = mins[0];
+        float maxLog = max(maxs[0], minLog + 0.001);
+        frameRange.range = vec4(minLog, maxLog, 0.0, 0.0);
+    }
+}
