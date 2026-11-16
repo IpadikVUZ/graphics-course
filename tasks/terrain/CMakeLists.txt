@@ -12,3 +12,5 @@ target_add_shaders(terrain
   shaders/terrain.frag
   shaders/generate.comp
 )
+
+target_compile_definitions(terrain PRIVATE TERRAIN_TEXTURES_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}/textures/\")

@@ -5,6 +5,7 @@
 #include <etna/GraphicsPipeline.hpp>
 #include <etna/ComputePipeline.hpp>
 #include <glm/glm.hpp>
+#include <array>
 #include "wsi/Keyboard.hpp"
 #include "FramePacket.hpp"
 
@@ -45,6 +46,10 @@ private:
   static_assert(sizeof(NoiseSettings) == 32);
 
   void generateMaps(vk::CommandBuffer cmd_buf);
+  void uploadTextures(vk::CommandBuffer cmd_buf);
+  static constexpr uint32_t kAtlasWidth = 4096;
+  static constexpr uint32_t kAtlasHeight = 1024;
+  static constexpr uint32_t kTextureMipLevels = 11;
   static constexpr uint32_t kGridCells = 256;
   static constexpr uint32_t kIndexCount = kGridCells * kGridCells * 6;
 
@@ -54,9 +59,12 @@ private:
   etna::Image roughnessAtlas;
   etna::Image detailHeightAtlas;
   etna::Sampler sampler;
+  vk::UniqueSampler materialSampler;
+  std::array<etna::Buffer, 3> textureStaging;
   etna::Buffer indices;
   etna::GraphicsPipeline drawPipeline{};
   etna::ComputePipeline generatePipeline{};
   glm::uvec2 resolution{};
   bool pendingGeneration = true;
+  bool pendingTextureUpload = true;
 };
